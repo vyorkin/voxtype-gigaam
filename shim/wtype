@@ -1,0 +1,115 @@
+#!/usr/bin/env sh
+# wtype shim implementing voxtype "variant B" focus guard.
+#
+# Voxtype calls `wtype` to type the transcription into the focused window.
+# This shim compares the currently focused window against the window that was
+# focused when dictation started (saved by `voxtype-target remember`):
+#
+#   same window (or no target recorded) -> exec the real wtype, type normally
+#   different window                    -> do NOT type anywhere; copy the text
+#                                          to the clipboard and notify the user
+#
+# This avoids stealing focus back from wherever the user moved to.
+#
+# Set VOXTYPE_REAL_WTYPE to override the real binary (used by tests).
+set -eu
+
+REAL_WTYPE="${VOXTYPE_REAL_WTYPE:-/usr/bin/wtype}"
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/voxtype"
+TARGET_FILE="$STATE_DIR/target"
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/voxtype-shim.log"
+
+mkdir -p "$STATE_DIR"
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true; }
+
+# Collect the option args (before "--") and the text (after it).
+text=""
+saw_sep=0
+opts=""
+for arg in "$@"; do
+  if [ "$saw_sep" = 1 ]; then
+    if [ -n "$text" ]; then text="$text $arg"; else text="$arg"; fi
+  elif [ "$arg" = "--" ]; then
+    saw_sep=1
+  else
+    opts="$opts $arg"
+  fi
+done
+
+# No target recorded -> behave exactly like wtype.
+if [ ! -s "$TARGET_FILE" ]; then
+  exec "$REAL_WTYPE" "$@"
+fi
+target=$(cat "$TARGET_FILE" 2>/dev/null || true)
+if [ -z "$target" ] || [ "$target" = "null" ]; then
+  exec "$REAL_WTYPE" "$@"
+fi
+
+current=$(timeout 2 hyprctl -j activewindow 2>/dev/null | jq -r '.address // empty' || true)
+
+# Same window still focused -> type normally, but in word-sized chunks.
+#
+# wtype builds one xkb keymap per invocation. A long Cyrillic string overflows
+# it and some keysyms collide, so Chromium/Electron apps (Obsidian, VS Code)
+# silently drop characters ("подготовки" -> "пготовки", "данных" -> "анных").
+# Typing one word per call keeps each keymap small enough to survive, and the
+# per-character delay from voxtype (-d) keeps Electron from dropping events.
+# Key-only events (auto_submit, newlines) still get a plain exec.
+if [ -n "$current" ] && [ "$current" = "$target" ]; then
+  case "$text" in
+    *'
+'*)
+      # Multi-line text: keep the old single call so newline keys are sent as
+      # before (voxtype converts them via shift_enter_newlines).
+      exec "$REAL_WTYPE" "$@"
+      ;;
+  esac
+  if [ "$saw_sep" = 1 ] && [ -n "$text" ]; then
+    set -f
+    # shellcheck disable=SC2086
+    set -- $text
+    total=$#
+    index=0
+    for word in "$@"; do
+      index=$((index + 1))
+      if [ "$index" -lt "$total" ]; then
+        # shellcheck disable=SC2086
+        "$REAL_WTYPE" $opts -- "$word "
+      else
+        # shellcheck disable=SC2086
+        "$REAL_WTYPE" $opts -- "$word"
+      fi
+      sleep 0.02
+    done
+    set +f
+    exit 0
+  fi
+  exec "$REAL_WTYPE" "$@"
+fi
+
+# Focus moved (or nothing focused). Do not type into the wrong place.
+#
+# Important: voxtype waits for the wtype process AND for EOF on the stderr
+# pipe. `wl-copy` forks a background child that serves the selection, so it
+# must not inherit that pipe or voxtype blocks forever. Detach every fd of
+# the helpers (stdin comes from printf, so only the other two are redirected).
+if [ "$saw_sep" = 1 ] && [ -n "$text" ]; then
+  printf '%s' "$text" | setsid /usr/bin/wl-copy >/dev/null 2>&1
+  # Notify through Omarchy's helper when available. Its app_name is
+  # "omarchy-action", which Omarchy's shell lets through Do-Not-Disturb, so the
+  # clipboard fallback is never silent. Fall back to notify-send with the same
+  # app_name for the same DND bypass behavior.
+  if [ -x /usr/share/omarchy/bin/omarchy-notification-send ]; then
+    setsid /usr/share/omarchy/bin/omarchy-notification-send \
+      "Voxtype" "Focus changed. Transcription copied to clipboard." >/dev/null 2>&1 || true
+  else
+    setsid /usr/bin/notify-send -a omarchy-action -u normal "Voxtype" \
+      "Focus changed. Transcription copied to clipboard." >/dev/null 2>&1 || true
+  fi
+  log "diverted to clipboard (target=$target current=${current:-none})"
+else
+  # Key-only event (auto_submit/shift-enter). Drop it rather than send it
+  # into the wrong window.
+  log "dropped key event (target=$target current=${current:-none})"
+fi
+exit 0

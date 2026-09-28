@@ -56,6 +56,9 @@ voxtype остаётся фронтендом: горячая клавиша, OS
 | `~/.local/share/whisper.cpp` | Сборка whisper.cpp с Vulkan. Используется бинарник `build/bin/whisper-server` (второе мнение для английского). |
 | `~/.config/systemd/user/whisper-server.service` | Долгоживущий `whisper-server` с large-v3-turbo на `127.0.0.1:9018`. |
 | `~/.local/bin/voxtype-stt` | Переключатель профилей. |
+| `~/.local/bin/voxtype-target` | Запоминает окно, в котором началась диктовка (focus guard). |
+| `~/.local/share/voxtype-shim/wtype` | Шим `wtype`: focus guard и печать по словам (см. «Печать в Electron-приложениях»). |
+| `~/.config/systemd/user/voxtype.service.d/path.conf` | Ставит шим впереди `/usr/bin/wtype` в PATH демона. |
 | `~/.local/state/voxtype-stt/` | Состояние переключателя: активный профиль и сохранённые значения whisper. |
 | `~/.cache/huggingface/hub/models--istupakov--gigaam-v3-onnx` | Веса русской модели. Загрузка одноразовая, дальше сервис работает офлайн (`HF_HUB_OFFLINE=1`). |
 | `~/.cache/huggingface/hub/models--istupakov--parakeet-tdt-0.6b-v3-onnx` | Веса английской модели, тот же кэш. |
@@ -63,16 +66,24 @@ voxtype остаётся фронтендом: горячая клавиша, OS
 ## Установка
 
 Файлы в репозитории: `server.py`, `analyze-dumps`, `bench-stt`, `replacements.tsv`,
-`samples/`, `bin/voxtype-stt`, `bin/voxtype-replacements`,
-`systemd/voxtype-gigaam.{socket,service}`, `systemd/whisper-server.service`.
+`samples/`, `bin/voxtype-{stt,replacements,target}`, `shim/wtype`,
+`systemd/voxtype-gigaam.{socket,service}`, `systemd/whisper-server.service`,
+`systemd/voxtype.service.d/path.conf`.
 
 ```sh
 git clone https://github.com/vyorkin/voxtype-gigaam ~/.local/share/voxtype-gigaam
 cd ~/.local/share/voxtype-gigaam
 python -m venv .venv && .venv/bin/pip install 'onnx-asr[cpu,hub]' numpy
 install -Dm755 bin/* ~/.local/bin/
-install -Dm644 systemd/* ~/.config/systemd/user/
+install -Dm755 shim/wtype ~/.local/share/voxtype-shim/wtype
+install -Dm644 systemd/voxtype-gigaam.service systemd/voxtype-gigaam.socket \
+    systemd/whisper-server.service ~/.config/systemd/user/
+install -Dm644 systemd/voxtype.service.d/path.conf \
+    ~/.config/systemd/user/voxtype.service.d/path.conf
 systemctl --user daemon-reload
+# в ~/.config/voxtype/config.toml (см. «Печать в Electron-приложениях»):
+#   [output] type_delay_ms = 10
+#   [output] pre_recording_command = "$HOME/.local/bin/voxtype-target remember"
 # собрать whisper-server (см. «Сборка whisper-server»)
 voxtype-stt gigaam
 ```
@@ -132,6 +143,45 @@ voxtype-stt toggle    # переключить туда-обратно
 Сокет `voxtype-gigaam.socket` включён в `sockets.target`, поэтому после перезагрузки он
 слушает, но сервис **не** стартует сам: первый запрос от voxtype поднимает его за ~1.4 с.
 Когда профиль `whisper`, сервис просто остановлен и память не занимает.
+
+## Печать в Electron-приложениях
+
+Отдельная проблема — не распознавание, а **ввод текста**. В приложениях на Electron/Chromium
+(Obsidian, VS Code, Discord) `wtype` теряет часть кириллических символов: он строит одну XKB-
+раскладку на всю строку, и при большом наборе символов часть keysyms затирает друг друга.
+В обычном терминале (foot, kitty) это незаметно, а в Obsidian из
+«`я запустил сбор данных для подготовки... предсказаний`» получается
+«`я запустил сборанныхля пготовки... прсказани`» — пропадают `д`, `л`, `м`, `ы`, `й`.
+
+Замер на одном и том же предложении (вывод в Obsidian):
+
+| способ | результат |
+|---|---|
+| одна длинная строка, `wtype -d 1` | теряет `д`, `л`, `м`, `ы`, `й` |
+| одна длинная строка, `wtype -d 15` | теряет те же символы (задержка не помогает) |
+| куски по ~40 символов, `-d 15` | всё равно теряет |
+| **по одному слову, `-d 10`** | **точно** |
+
+Оба условия важны: дробить строку (иначе ломается раскладка wtype) и держать задержку
+между символами (иначе Electron не успевает).
+
+Поэтому `wtype` обёрнут шимом `~/.local/share/voxtype-shim/wtype`, который:
+
+1. держит focus guard — если фокус уехал из окна, где началась диктовка, текст летит в
+   буфер обмена с уведомлением, а не в чужое окно;
+2. когда окно то же, печатает текст **по одному слову** отдельными вызовами `/usr/bin/wtype`,
+   сохраняя ключи, которые передал voxtype (`-d N`, `-s N`).
+
+Шим подхватывается тремя частями:
+
+* `~/.config/systemd/user/voxtype.service.d/path.conf` ставит каталог шима первым в `PATH`;
+* `~/.local/bin/voxtype-target remember` вызывается через
+  `pre_recording_command` в `~/.config/voxtype/config.toml` и запоминает окно диктовки;
+* `type_delay_ms = 10` в `[output]` — задержка между символами (в voxtype 1.1.0 этот ключ
+  убрали из `voxtype config`, но поле все ещё читается из файла и передаётся в `wtype` как `-d`).
+
+Многострочный текст (переносы строк) шим отправляет одним вызовом, как раньше, — чтобы не
+потерять семантику `shift_enter_newlines` и автосабмита.
 
 ## Смешанная речь и технические термины
 
