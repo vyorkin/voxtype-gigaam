@@ -1,0 +1,10 @@
+[Unit]
+Description=GigaAM STT server socket (socket-activated, for voxtype remote mode)
+
+[Socket]
+ListenStream=127.0.0.1:9017
+# The server loads a ~230 MB model on start, so keep the queue generous.
+Backlog=16
+
+[Install]
+WantedBy=sockets.target

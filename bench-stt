@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# bench-stt — compare the active backends on the same WAV file(s).
+#
+#   bench-stt [WAV ...] [RUNS]
+#
+# Runs voxtype's own transcriber (the real code path, including the HTTP hop for
+# GigaAM/Parakeet) once per backend and prints wall time plus the recognized
+# text. Model load time is included, which is what a cold process pays; the
+# daemon keeps the models warm, so live dictation is faster than these numbers.
+# Without arguments the bundled Russian and English samples are used.
+
+set -euo pipefail
+
+ROOT="$HOME/.local/share/voxtype-gigaam"
+SAMPLES=("$ROOT/samples/ru_sample.wav" "$ROOT/samples/en_sample.wav")
+MODEL="${WHISPER_MODEL:-large-v3-turbo}"
+ENDPOINT="${VOXTYPE_GIGAAM_ENDPOINT:-http://127.0.0.1:9017}"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+RUNS=3
+WAVS=()
+for arg in "$@"; do
+  if [[ "$arg" =~ ^[0-9]+$ ]]; then RUNS="$arg"; else WAVS+=("$arg"); fi
+done
+[ "${#WAVS[@]}" -gt 0 ] || WAVS=("${SAMPLES[@]}")
+
+cat >"$TMP_DIR/whisper.toml" <<EOF
+engine = "whisper"
+
+[whisper]
+mode = "local"
+model = "$MODEL"
+language = "auto"
+flash_attention = true
+EOF
+
+cat >"$TMP_DIR/gigaam.toml" <<EOF
+engine = "whisper"
+
+[whisper]
+mode = "remote"
+remote_endpoint = "$ENDPOINT"
+remote_model = "auto"
+language = "auto"
+EOF
+
+run() {
+  local label="$1" config="$2" wav="$3" i start end text elapsed total=0
+  for i in $(seq 1 "$RUNS"); do
+    start=$(date +%s%N)
+    text=$(voxtype -c "$config" --quiet transcribe "$wav" 2>/dev/null | tail -1)
+    end=$(date +%s%N)
+    elapsed=$(( (end - start) / 1000000 ))
+    total=$(( total + elapsed ))
+    printf '    run %d: %6d ms\n' "$i" "$elapsed"
+  done
+  printf '    avg  : %6d ms\n' "$(( total / RUNS ))"
+  printf '    text : %s\n' "$text"
+}
+
+for wav in "${WAVS[@]}"; do
+  [ -f "$wav" ] || { echo "bench-stt: no such WAV: $wav" >&2; exit 1; }
+  duration=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$wav" 2>/dev/null || echo '?')
+  printf '\n%s (%ss), runs per backend: %s\n' "$(basename "$wav")" "$duration" "$RUNS"
+  printf '  local whisper.cpp (%s, GPU)\n' "$MODEL"
+  run whisper "$TMP_DIR/whisper.toml" "$wav"
+  printf '  GigaAM/Parakeet (remote HTTP, CPU, auto)\n'
+  run gigaam "$TMP_DIR/gigaam.toml" "$wav"
+done

@@ -1,0 +1,35 @@
+[Unit]
+Description=GigaAM STT server (OpenAI-compatible endpoint for voxtype remote mode)
+Documentation=file:%h/.local/share/voxtype-gigaam/server.py
+After=network.target whisper-server.service
+Wants=whisper-server.service
+
+[Service]
+Type=simple
+# Started on demand by voxtype-gigaam.socket; the listening socket is passed in
+# as fd 3. The model stays in memory until the unit is stopped, so switching
+# back to the whisper profile should stop it explicitly.
+Environment=HF_HUB_OFFLINE=1
+Environment=VOXTYPE_GIGAAM_HOST=127.0.0.1
+Environment=VOXTYPE_GIGAAM_PORT=9017
+Environment=VOXTYPE_GIGAAM_THREADS=6
+# Keep the exact audio of the last 200 requests (WAV + JSON metadata) in
+# ~/.local/state/voxtype-stt/dumps, so accuracy problems can be reproduced
+# offline. Unset this to stop dumping.
+Environment=VOXTYPE_GIGAAM_DUMP_DIR=%h/.local/state/voxtype-stt/dumps
+# Second opinion: phrases whose GigaAM output has no Cyrillic (English speech)
+# or contains Latin words (code-switching, where GigaAM hears the English word
+# but usually misspells it) are re-decoded by the local whisper.cpp server,
+# which is the only model here that keeps embedded English in Latin script.
+# Point this at whisper-server; unset to fall back to Parakeet (or to GigaAM
+# alone when VOXTYPE_GIGAAM_ENGLISH=0).
+Environment=VOXTYPE_WHISPER_ENDPOINT=http://127.0.0.1:9018/inference
+# Parakeet is no longer used to choose between models (its mean token logprob
+# is ~0.09 higher than GigaAM's on the same audio). It is kept only as a
+# fallback for English when the whisper server is unreachable.
+Environment=VOXTYPE_GIGAAM_ENGLISH=1
+ExecStart=%h/.local/share/voxtype-gigaam/.venv/bin/python %h/.local/share/voxtype-gigaam/server.py
+Restart=on-failure
+RestartSec=2
+# Dictation is interactive; do not let a busy machine starve the decoder.
+Nice=-5

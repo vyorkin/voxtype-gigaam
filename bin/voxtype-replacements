@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Sync the curated replacement dictionary into voxtype's `text.replacements`.
+
+voxtype applies those literally, case-insensitively and on word boundaries, after
+transcription and before output. Keeping them in a file (default
+`~/.local/share/voxtype-gigaam/replacements.tsv`) makes the whole set editable,
+section-selectable and removable in one command.
+
+Usage:
+    voxtype-replacements [apply] [--section NAME]... [--except NAME]... [--dry-run]
+    voxtype-replacements list        # show the file, grouped by section
+    voxtype-replacements show        # show what is currently in config.toml
+    voxtype-replacements diff        # compare the file against config.toml
+    voxtype-replacements remove [--section NAME]...   # unset these entries
+
+`whisper.*`/`text.*` are read by the daemon at startup, so finish with
+`systemctl --user restart voxtype.service`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+FILE = Path(
+    os.environ.get(
+        "VOXTYPE_REPLACEMENTS_FILE",
+        Path.home() / ".local/share/voxtype-gigaam/replacements.tsv",
+    )
+)
+CONFIG = Path(
+    os.environ.get("VOXTYPE_CONFIG", Path.home() / ".config/voxtype/config.toml")
+)
+KEY_PREFIX = "text.replacements."
+
+
+def parse(path: Path) -> list[tuple[str, str, str]]:
+    """Return (section, from, to) entries; '#' lines and blanks are skipped."""
+    if not path.exists():
+        sys.exit(f"voxtype-replacements: no such file: {path}")
+    entries: list[tuple[str, str, str]] = []
+    section = "default"
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if "\t" not in line:
+            sys.exit(f"voxtype-replacements: {path}:{lineno}: expected FROM<TAB>TO")
+        found, replacement = line.split("\t", 1)
+        entries.append((section, found.strip(), replacement.replace("\\n", "\n")))
+    return entries
+
+
+def select(
+    entries: list[tuple[str, str, str]], only: list[str], skip: list[str]
+) -> list[tuple[str, str, str]]:
+    sections = {entry[0] for entry in entries}
+    unknown = (set(only) | set(skip)) - sections
+    if unknown:
+        sys.exit(
+            f"voxtype-replacements: unknown section(s): {', '.join(sorted(unknown))}\n"
+            f"available: {', '.join(sorted(sections))}"
+        )
+    return [
+        entry
+        for entry in entries
+        if (not only or entry[0] in only) and entry[0] not in skip
+    ]
+
+
+def configured() -> dict[str, str]:
+    if not CONFIG.exists():
+        return {}
+    with CONFIG.open("rb") as handle:
+        data = tomllib.load(handle)
+    return data.get("text", {}).get("replacements", {}) or {}
+
+
+def config_set(found: str, replacement: str, dry_run: bool) -> None:
+    command = ["voxtype", "config", "set", KEY_PREFIX + found, replacement]
+    if dry_run:
+        print(" ".join(repr(part) for part in command))
+        return
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
+
+
+def config_unset(found: str, dry_run: bool) -> None:
+    command = ["voxtype", "config", "unset", KEY_PREFIX + found]
+    if dry_run:
+        print(" ".join(repr(part) for part in command))
+        return
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "command", nargs="?", default="apply", choices=["apply", "remove", "list", "show", "diff"]
+    )
+    parser.add_argument("--section", action="append", default=[], metavar="NAME")
+    parser.add_argument("--except", action="append", default=[], dest="skip", metavar="NAME")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    entries = parse(FILE)
+    chosen = select(entries, args.section, args.skip)
+
+    if args.command == "list":
+        current = None
+        for section, found, replacement in entries:
+            if section != current:
+                current = section
+                print(f"[{section}]")
+            shown = replacement.replace("\n", "\\n")
+            print(f"  {found} -> {shown}")
+        return 0
+
+    if args.command == "show":
+        current = configured()
+        for found, replacement in sorted(current.items()):
+            print(f"  {found} -> {replacement.replace(chr(10), chr(92) + 'n')}")
+        print(f"{len(current)} replacements in {CONFIG}")
+        return 0
+
+    if args.command == "diff":
+        current = configured()
+        wanted = {found: replacement for _, found, replacement in chosen}
+        missing = {k: v for k, v in wanted.items() if current.get(k) != v}
+        extra = {k: v for k, v in current.items() if k not in wanted}
+        for found, replacement in sorted(missing.items()):
+            print(f"  file only / differs: {found} -> {replacement!r}")
+        for found, replacement in sorted(extra.items()):
+            print(f"  config only:         {found} -> {replacement!r}")
+        if not missing and not extra:
+            print("  file and config.toml match")
+        return 0
+
+    if args.command == "remove":
+        for _, found, _ in chosen:
+            config_unset(found, args.dry_run)
+        print(f"{'would remove' if args.dry_run else 'removed'} {len(chosen)} replacements")
+        print("apply with: systemctl --user restart voxtype.service")
+        return 0
+
+    for _, found, replacement in chosen:
+        config_set(found, replacement, args.dry_run)
+    print(f"{'would set' if args.dry_run else 'set'} {len(chosen)} replacements from {FILE}")
+    print("apply with: systemctl --user restart voxtype.service")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
