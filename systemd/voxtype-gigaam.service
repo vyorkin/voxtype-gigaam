@@ -28,6 +28,15 @@ Environment=VOXTYPE_WHISPER_ENDPOINT=http://127.0.0.1:9018/inference
 # is ~0.09 higher than GigaAM's on the same audio). It is kept only as a
 # fallback for English when the whisper server is unreachable.
 Environment=VOXTYPE_GIGAAM_ENGLISH=1
+# Numpy's OpenBLAS builds its own pool sized to the machine (16 threads here)
+# and busy-waits in it for the small matrix products of the feature front-end.
+# Those threads, not the decoder, were the bulk of this service's CPU: with
+# them pinned to one thread, one 4.3 s utterance costs ~196 ms of CPU instead
+# of ~1180 ms, and returns slightly faster (75 ms vs 102 ms). ONNX Runtime's
+# intra-op pool is what actually parallelizes the decode, so nothing is lost.
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
 ExecStart=%h/.local/share/voxtype-gigaam/.venv/bin/python %h/.local/share/voxtype-gigaam/server.py
 Restart=on-failure
 RestartSec=2

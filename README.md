@@ -328,7 +328,19 @@ analyze-dumps ~/.local/state/voxtype-stt/dumps '20260928-1522*.wav'
 - Parakeet как запасной движок: `VOXTYPE_GIGAAM_ENGLISH=0` в юните полностью выключает его
   (тогда при недоступном whisper остаётся только GigaAM).
 - Словарь замен: `~/.local/share/voxtype-gigaam/replacements.tsv` + `voxtype-replacements`.
-- Потоки ONNX Runtime: `VOXTYPE_GIGAAM_THREADS` в юните (по умолчанию 6 из 12).
+- Потоки ONNX Runtime: `VOXTYPE_GIGAAM_THREADS` в юните (по умолчанию 6 из 12). Это
+  единственный пул, который параллелит сам декод.
+- **Пулы, которые жгли CPU вхолостую.** Numpy в venv собран с OpenBLAS, а тот заводит свой пул
+  по числу ядер и крутится в нём в ожидании работы даже на крошечных матричных умножениях
+  фронтенда. На коротких диктовочных фразах это и было основной статьёй расхода: одна фраза
+  4.3 с стоила ~1180 мс CPU, из них ~700 мс — этот пул, ещё ~500 мс — busy-wait пула ONNX
+  Runtime после `Run()` (`session.intra_op.allow_spinning`). В юните оба пула прижаты:
+  `OPENBLAS_NUM_THREADS=1`, `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, а в `server.py` для сессии
+  выставлен `session.intra_op.allow_spinning=0`. Итог: ~196 мс CPU на ту же фразу при том же
+  (даже чуть меньшем) времени ответа — 75 мс против 102 мс. Запросы к модели всё равно
+  сериализуются `self._lock`, ждать потокам нечего. Проверка на живом сервисе: в покое 0.00
+  ядра, во время диктовки 0.1–0.6 ядра вместо 1.4–5.9. Если менять `VOXTYPE_GIGAAM_THREADS`,
+  остальные пулы трогать не нужно.
 - Чанки eager **выключены** (`whisper.eager_processing = false`), и это осознанно: склейка
   чанков в voxtype (`src/eager.rs`, `deduplicate_boundary`) сравнивает слова через
   `eq_ignore_ascii_case`, который фолдит только латиницу. Русские слова с заглавными и

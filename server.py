@@ -119,6 +119,13 @@ class Recognizer:
             options = ort.SessionOptions()
             options.intra_op_num_threads = self._threads
             options.inter_op_num_threads = 1
+            # ONNX Runtime's thread pool busy-waits for new work after every
+            # Run() by default, which on short dictation phrases costs several
+            # times more CPU than the decode itself (measured: ~700 ms of CPU
+            # per 4.3 s utterance, ~196 ms with spinning off, same wall time).
+            # Requests are serialized per model by self._lock, so the pool has
+            # nothing to meet halfway.
+            options.add_session_config_entry("session.intra_op.allow_spinning", "0")
             started = time.monotonic()
             # The timestamped adapter is used even though timestamps are not
             # needed: it is the one that returns per-token logprobs, which the
