@@ -83,6 +83,36 @@ def detect_language(text: str, fallback: str) -> str:
     return "ru" if cyrillic_ratio(text) >= CYRILLIC_THRESHOLD else "en"
 
 
+WORD_RE = re.compile(r"\w+")
+
+
+def dictation_style(text: str) -> str:
+    """Turn a model sentence into a dictation fragment.
+
+    GigaAM and Parakeet both capitalise the first word and close the sentence
+    with a period, but dictation is pasted into the middle of a chat message
+    or an editor line, where the user wants neither. Only the first word is
+    touched, and only when its remaining letters are all lowercase: a first
+    word like "GitHub" or "API" is a name or an acronym, not sentence casing.
+    "?" and "!" stay, because they carry meaning the speaker put there.
+    """
+    text = text.strip()
+    if text.endswith("."):
+        text = text[:-1].rstrip()
+    for index, char in enumerate(text):
+        if char.isalpha():
+            word = WORD_RE.match(text, index)
+            assert word is not None
+            if not any(inner.isupper() for inner in word.group()[1:]):
+                text = text[:index] + char.lower() + text[index + 1 :]
+            break
+        if char.isalnum():
+            # The utterance starts with a numeral, so there is no sentence
+            # capital to undo.
+            break
+    return text
+
+
 def route(model_field: str | None, english_enabled: bool) -> str:
     """Decide which model the request asks for: 'ru', 'en' or 'auto'."""
     name = (model_field or "").strip().lower()
@@ -466,6 +496,10 @@ class Handler(BaseHTTPRequestHandler):
                 used = "en"
             else:
                 text, used, confidence = self._transcribe_auto(samples, sample_rate)
+            # The response is a dictation fragment, not a sentence; the dump
+            # below keeps the raw model text so accuracy analysis still sees
+            # what the model actually produced.
+            styled_text = dictation_style(text)
             elapsed = time.monotonic() - started
             self.log_message(
                 "transcribed %.2fs audio (rms=%.4f peak=%.3f) in %.2fs via %s "
@@ -487,6 +521,7 @@ class Handler(BaseHTTPRequestHandler):
                     "model": self._model_id(used),
                     "language": detect_language(text, used),
                     "role": used,
+                    "styled": styled_text,
                     "requested": requested or "default",
                     "seconds": round(seconds, 3),
                     "rms": round(rms, 5),
@@ -499,7 +534,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(
                 200,
                 {
-                    "text": text,
+                    "text": styled_text,
                     "model": self._model_id(used),
                     "language": detect_language(text, used),
                 },
